@@ -6,9 +6,11 @@ require "optparse"
 require "csv"
 require "rss"
 require "open-uri"
-require "reverse-markdown"
+require "reverse_markdown"
 require "nokogiri"
 require "json"
+require "octokit"
+require "cgi"
 
 options = {}
 
@@ -46,13 +48,14 @@ opt_parser = OptionParser.new do |opt|
     options[:verbose] = true
   end
   
+  opt.on("-p PRIVATE_ACCESS_TOKEN") do |private_access_token|
+    options[:private] = private_access_token
+  end
+  
   opt.on("-h", "--help", "help") do
     puts opt_parser
     exit
   end
-
-
-  
 end
 
 opt_parser.parse!
@@ -63,26 +66,17 @@ if ARGV.size <2
   exit
 end
 
-username = ask("Github username: ") {}
-puts "empty username" and exit if username.empty?
-
-password = ask("Github password: ") { |q| q.echo = '*' }
-puts "empty password" and exit if password.empty?
-
-api_uri = "https://#{username}:#{password}@api.github.com"
+api_uri = "https://api.github.com"
+client = Octokit::Client.new access_token: options[:private]
+user = client.user
+puts user.name
 
 puts "Authenticating..."
-
-begin
-  res = RestClient.get api_uri 
-rescue Exception => e
-  puts "Could not connect " + e.message
-  exit
-end
 
 repo_user = ARGV[0]
 repo = ARGV[1]
 csv_file = ARGV[2]
+git_repo = "#{repo_user}/#{repo}"
 
 if options[:user_file] 
   users = YAML.load_file(options[:user_file])
@@ -111,12 +105,12 @@ redmine_issues.each do |row|
   # check for exporting commit
   if options[:redmine]
    r = options[:redmine]
-   url = "#{r[1]}/issues/show/#{issue_num}?format=atom&key=#{r[0]}"
+   url = "#{r[1]}/issues/#{issue_num}.atom?include=journals"
    
    comments = []
   
    # parse comment
-   doc = Nokogiri::XML(open(url))
+   doc = Nokogiri::XML(URI.open(url, "X-Redmine-API-Key" => "#{r[0]}"))
    doc.css('entry').each do |entry|
      name = entry.at_css("author name").content
 
@@ -127,9 +121,9 @@ redmine_issues.each do |row|
      content = entry.at_css("content")
 
      if options[:convert_markdown]
-       r = ReverseMarkdown.new
        begin
-         content = r.parse_string(content)
+         content = CGI.unescapeHTML(content)
+         content = ReverseMarkdown.convert(content, github_flavored: true)
        rescue
          content = content.to_s
        end
@@ -173,27 +167,27 @@ redmine_issues.each do |row|
   # post issue to github
   # process labels
   labels = []
-  labels.push("bug") if tracker == "Bug"
-  labels.push("enhancement") if tracker == "Feature"
-  labels.push("prio-normal") if priority == "Normal"
-  labels.push("prio-high") if priority == "High"
-  labels.push("prio-urgent") if priority == "Urgent"
-  labels.push("prio-immediate") if priority == "Immediate"
+  labels.push("bug") if tracker == "バグ"
+  labels.push("enhancement") if tracker == "機能"
+  labels.push("support") if tracker == "サポート"
+  labels.push("prio-normal") if priority == "通常"
+  labels.push("prio-high") if priority == "高い"
+  labels.push("prio-urgent") if priority == "急いで"
+  labels.push("prio-immediate") if priority == "今すぐ"
 
   labels.each do |label|
     # create label
     begin
       next if created_label.include?(label)
 
-      label_param = {"name" => label, "color" => ("%06x" % (rand * 0xffffff))}
-      res = RestClient.post "#{api_uri}/repos/#{repo_user}/#{repo}/labels", label_param.to_json, :content_type => :json
+      client.add_label(git_repo, label, "%06x" % (rand * 0xffffff))
       created_label.push(label)
     rescue
     end
   end unless options[:dry_run]
 
   params = {"title" => subject,
-    "body" => description.strip,
+    "body" => "Redmine #: #{issue_num}\n" + description.strip,
     "labels" => labels,
   }
 
@@ -203,11 +197,11 @@ redmine_issues.each do |row|
 
   jdata = JSON.generate(params)
   begin
-    add_issue_uri = "#{api_uri}/repos/#{repo_user}/#{repo}/issues"
-    res = RestClient.post add_issue_uri, jdata, :content_type => :json, :accept => :json
+    res = client.create_issue(git_repo, params["title"], params["body"],
+                              :labels => params["labels"], :assignee => params['assignee'])
 
     #get issues number
-    github_issue_num = JSON.parse(res)['number']
+    github_issue_num = res[:number]
 
     #post comment if exists
     if !comments.empty?
@@ -216,19 +210,15 @@ redmine_issues.each do |row|
         body = body + "Date: #{comment['date']}\n\n"
         body = body + "#{comment['content'].strip}"
         params = {"body" => body}
-        comment_uri = "#{api_uri}/repos/#{repo_user}/#{repo}/issues/#{github_issue_num}/comments"
        
-        res = RestClient.post comment_uri, params.to_json, :content_type => :json
-
+        client.add_comment(git_repo, github_issue_num, params["body"])
       end
     end
 
     # close issue if its status is closed
     if options[:closed_status_names].include? status
       puts "Closing issue..."
-      update_issue_uri = "#{api_uri}/repos/#{repo_user}/#{repo}/issues/#{github_issue_num}"
-      params = {state: 'closed'}
-      res = RestClient.patch update_issue_uri, params.to_json, :content_type => :json, :accept => :json
+      client.close_issue(git_repo, github_issue_num)
     end
     
   rescue Exception => e
